@@ -1,0 +1,68 @@
+# Misc
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.sass-cache/
+github-workflows/
+*.swo
+.worklogs/
+*.proj
+*.sln
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Android Studio related
+*.keystore
+*.kts
+*.gradle
+!gradle-wrapper.properties
+
+# Surrounding
+*.orig
+
+# Cargo
+target/
+
+# Firebase
+firebase-debug.log
+firebase-empty-rules
+firebase-debug.log
+firebase.out
+functions/.env
+
+# Flutter/Dart/Pub
+/pubspec_overrides.dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.root_metadata
+build/
+.dartstyle/
+.flutter/
+
+# Generated files
+gen/
+*.g.dart
+*.freezed.dart
+*.json
+!package.json
+!package-lock.json
+!otp-backend/package.json
+!otp-backend/package-lock.json
+
+# External OTP backend secrets
+otp-backend/.env
+otp-backend/.env.*
+!otp-backend/.env.example
+otp-backend/serviceAccountKey.json
+otp-backend/*service-account*.json

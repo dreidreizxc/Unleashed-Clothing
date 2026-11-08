@@ -1,0 +1,13 @@
+{
+  "name": "unleashed-firestore-rules-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Offline Firestore security-rules tests for the canonical Unleashed rules. Runs only against the local emulator.",
+  "scripts": {
+    "test": "node --test rules.test.cjs"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "3.0.4",
+    "firebase": "10.14.1"
+  }
+}

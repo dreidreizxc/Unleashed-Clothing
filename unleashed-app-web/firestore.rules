@@ -1,0 +1,257 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.admin == true;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isOwner(customerId) {
+      return isSignedIn() && request.auth.uid == customerId;
+    }
+
+    // Products are T-shirts only. `price` is an integer number of centavos.
+    function validProduct(data, allowArchived) {
+      return data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 120
+        && data.description is string
+        && data.description.size() <= 4000
+        && data.price is int
+        && data.price >= 0
+        && data.price <= 100000000
+        && data.status in (allowArchived
+          ? ['active', 'inactive', 'archived']
+          : ['active', 'inactive'])
+        && data.category == 'T-Shirt'
+        && data.sizes is list
+        && data.sizes.size() > 0
+        && data.sizes.size() <= 20
+        && data.stock is map
+        && data.totalStock is int
+        && data.totalStock >= 0
+        && (!data.keys().hasAny(['imageId']) || data.imageId == null || data.imageId is string)
+        && (!data.keys().hasAny(['imageContentType']) || data.imageContentType == null
+          || data.imageContentType in ['image/jpeg', 'image/png', 'image/webp']);
+    }
+
+    // Fields that must never change after an order is created.
+    function orderCoreUnchanged() {
+      return request.resource.data.customerId == resource.data.customerId
+        && request.resource.data.items == resource.data.items
+        && request.resource.data.total == resource.data.total
+        && request.resource.data.paymentMethod == resource.data.paymentMethod
+        && (!resource.data.keys().hasAny(['createdAt'])
+          || request.resource.data.createdAt == resource.data.createdAt)
+        && (!resource.data.keys().hasAny(['customerName'])
+          || request.resource.data.customerName == resource.data.customerName)
+        && (!resource.data.keys().hasAny(['customerEmail'])
+          || request.resource.data.customerEmail == resource.data.customerEmail)
+        && (!resource.data.keys().hasAny(['shippingAddress'])
+          || request.resource.data.shippingAddress == resource.data.shippingAddress);
+    }
+
+    function validAdminOrderUpdate() {
+      return orderCoreUnchanged()
+        && request.resource.data.status in
+          ['placed', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled', 'refunded']
+        && request.resource.data.paymentStatus in ['unpaid', 'paid', 'refunded']
+        && (!request.resource.data.keys().hasAny(['fulfillmentStatus'])
+          || request.resource.data.fulfillmentStatus in
+            ['unfulfilled', 'processing', 'shipped', 'delivered', 'cancelled'])
+        && (!request.resource.data.keys().hasAny(['adminNotes'])
+          || (request.resource.data.adminNotes is string
+            && request.resource.data.adminNotes.size() <= 2000))
+        && request.resource.data.updatedAt is timestamp;
+    }
+
+    function validCustomerCancellation() {
+      return isOwner(resource.data.customerId)
+        && resource.data.status == 'placed'
+        && request.resource.data.status == 'cancelled'
+        && orderCoreUnchanged()
+        && request.resource.data.paymentStatus == resource.data.paymentStatus;
+    }
+
+    // ---------------------------------------------------------------------
+    // Customer profiles
+    // ---------------------------------------------------------------------
+
+    match /users/{userId} {
+      // A customer can read their own profile; administrators can read all.
+      allow read: if isSelf(userId) || isAdmin();
+
+      allow create: if isSelf(userId)
+        && request.resource.data.keys().hasAll(['email', 'createdAt'])
+        && request.resource.data.email is string
+        && request.resource.data.createdAt is timestamp
+        && (!request.resource.data.keys().hasAny(['role'])
+          || request.resource.data.role == 'customer')
+        && (!request.resource.data.keys().hasAny(['totalOrders'])
+          || request.resource.data.totalOrders is int)
+        && (!request.resource.data.keys().hasAny(['totalSpent'])
+          || request.resource.data.totalSpent is int);
+
+      // Customers may edit their own profile, but cannot escalate a role or
+      // rewrite order-derived totals. Only the claim-granting script can make
+      // an administrator, and it never runs in the browser.
+      allow update: if isSelf(userId)
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.totalSpent == resource.data.totalSpent
+        && request.resource.data.totalOrders == resource.data.totalOrders;
+
+      allow delete: if false;
+
+      match /addresses/{addressId} {
+        allow read: if isSelf(userId) || isAdmin();
+        allow write: if isSelf(userId);
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Products (T-shirts only)
+    // ---------------------------------------------------------------------
+
+    match /products/{productId} {
+      // Public catalog reads remain available to the storefront.
+      allow read: if true;
+
+      allow create: if isAdmin()
+        && validProduct(request.resource.data, false)
+        && request.resource.data.keys().hasAll(['name', 'description', 'price', 'status', 'category'])
+        && (!request.resource.data.keys().hasAny(['imageId'])
+          || request.resource.data.imageId == null
+          || request.resource.data.imageId == productId);
+
+      allow update: if isAdmin()
+        && validProduct(request.resource.data, true)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && (!request.resource.data.keys().hasAny(['imageId'])
+          || request.resource.data.imageId == null
+          || request.resource.data.imageId == productId);
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // Product images stored as Firestore bytes (Spark plan)
+    // ---------------------------------------------------------------------
+
+    match /product_images/{imageId} {
+      // Images are administrative data. The public product document remains
+      // readable, but image bytes require the admin claim.
+      allow read: if isAdmin();
+
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasAll(['bytes', 'contentType', 'size', 'width', 'height', 'updatedAt'])
+        && request.resource.data.bytes is bytes
+        && request.resource.data.bytes.size() <= 360000
+        && request.resource.data.contentType in ['image/jpeg', 'image/png', 'image/webp']
+        && request.resource.data.size is int
+        && request.resource.data.size > 0
+        && request.resource.data.size <= 360000
+        && request.resource.data.width is int
+        && request.resource.data.width > 0
+        && request.resource.data.height is int
+        && request.resource.data.height > 0
+        && request.resource.data.updatedAt is timestamp;
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // Inventory audit trail (append-only for administrators)
+    // ---------------------------------------------------------------------
+
+    match /inventory_logs/{logId} {
+      allow read: if isAdmin();
+
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasAll(
+          ['productId', 'productName', 'size', 'previousQty', 'newQty', 'delta', 'reason', 'adminUid', 'createdAt'])
+        && request.resource.data.productId is string
+        && request.resource.data.productName is string
+        && request.resource.data.size is string
+        && request.resource.data.previousQty is int
+        && request.resource.data.previousQty >= 0
+        && request.resource.data.newQty is int
+        && request.resource.data.newQty >= 0
+        && request.resource.data.delta is int
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() <= 200
+        && request.resource.data.adminUid == request.auth.uid
+        && request.resource.data.createdAt is timestamp;
+
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Orders
+    // ---------------------------------------------------------------------
+
+    match /orders/{orderId} {
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasAll(['customerId', 'items', 'total', 'paymentMethod', 'status', 'paymentStatus', 'createdAt'])
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.items is list
+        && request.resource.data.total is int
+        && request.resource.data.total >= 0
+        && request.resource.data.paymentMethod == 'COD'
+        && request.resource.data.status == 'placed'
+        && request.resource.data.paymentStatus == 'unpaid'
+        && request.resource.data.createdAt is timestamp;
+
+      allow read: if isAdmin() || isOwner(resource.data.customerId);
+
+      // Administrators can change permitted status fields only. Customers may
+      // cancel their own order while it is still in the `placed` state and may
+      // change nothing else.
+      allow update: if (isAdmin() && validAdminOrderUpdate())
+        || validCustomerCancellation();
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Cart (customer-owned)
+    // ---------------------------------------------------------------------
+
+    match /carts/{userId}/items/{itemId} {
+      allow read, write: if isSelf(userId);
+    }
+
+    // ---------------------------------------------------------------------
+    // Administrative audit log and settings
+    // ---------------------------------------------------------------------
+
+    match /admin_activity_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasAll(['action', 'targetType', 'targetId', 'createdAt'])
+        && request.resource.data.action is string
+        && request.resource.data.targetType is string
+        && request.resource.data.targetId is string
+        && request.resource.data.adminUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /settings/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    // Everything else is denied by default.
+  }
+}

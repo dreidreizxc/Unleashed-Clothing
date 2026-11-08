@@ -1,0 +1,505 @@
+rules_version = '2';
+
+// Firestore rules for the Unleashed Clothing storefront and admin dashboard.
+//
+// Deployment target: the Spark plan. There are no Cloud Functions in the live
+// flow, so every privileged operation must be rejected here unless the caller
+// carries the `admin == true` custom claim.
+//
+// Order-request model
+// -------------------
+// * A customer may create one `pending_confirmation` request per deterministic
+//   client id. The request records the current catalogue prices as
+//   `requestedItems`, does not reserve stock, does not receive an official
+//   `orderNumber`, and keeps `paymentStatus: unpaid`, `totalsVerified: false`
+//   and `customerTotalsApplied: false`.
+// * The customer may only withdraw a request while it is still
+//   `pending_confirmation`. Confirmed orders can only be cancelled by an
+//   administrator, because stock and counters must be reversed.
+// * Only an administrator may write prices, stock, counters, official order
+//   numbers, verified totals, confirmation/rejection state, payment status,
+//   inventory logs and aggregate customer totals.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      // `.get()` keeps the rule safe when a customer token has no `admin`
+      // claim at all; direct property access can raise an evaluation error.
+      return isSignedIn() && request.auth.token.get('admin', false) == true;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+    function activeCustomer(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid))
+        && get(/databases/$(database)/documents/users/$(uid))
+             .data.get('isActive', true) != false;
+    }
+
+    function deliveredOrderFor(orderId, uid) {
+      return exists(/databases/$(database)/documents/orders/$(orderId))
+        && get(/databases/$(database)/documents/orders/$(orderId)).data.customerId == uid
+        && get(/databases/$(database)/documents/orders/$(orderId)).data.status == 'delivered';
+    }
+
+    function orderBelongsToCustomer(orderId, uid) {
+      return exists(/databases/$(database)/documents/orders/$(orderId))
+        && get(/databases/$(database)/documents/orders/$(orderId)).data.customerId == uid;
+    }
+
+    // Checkout writes the order and its notifications in one transaction.
+    // `get()` only sees committed data, so it cannot see the order that is
+    // being created by that same transaction. `getAfter()`/`existsAfter()`
+    // evaluate the projected state and make the atomic checkout possible.
+    function orderBelongsToCustomerAfterWrite(orderId, uid) {
+      return existsAfter(/databases/$(database)/documents/orders/$(orderId))
+        && getAfter(/databases/$(database)/documents/orders/$(orderId))
+             .data.customerId == uid;
+    }
+
+    // The request must carry a real delivery address so an order can never be
+    // created with an empty shipping destination.
+    function completeShippingAddress(data) {
+      return data is map
+        && data.keys().hasAll(
+             ['street', 'barangay', 'city', 'province', 'postalCode']
+           )
+        && data.street is string
+        && data.street.trim().size() > 0
+        && data.barangay is string
+        && data.barangay.trim().size() > 0
+        && data.city is string
+        && data.city.trim().size() > 0
+        && data.province is string
+        && data.province.trim().size() > 0
+        && data.postalCode is string
+        && data.postalCode.trim().size() > 0;
+    }
+
+    // Shared shape check for client-created in-app notifications.
+    function validNotificationCore(data) {
+      return data.title is string
+        && data.title.size() > 0
+        && data.title.size() <= 200
+        && data.body is string
+        && data.body.size() <= 500
+        && data.isRead == false;
+    }
+
+    // Customers may never write any of these administrator-owned fields on a
+    // request they create.
+    function noPrivilegedOrderFields(data) {
+      return !('orderNumber' in data)
+        && !('confirmedAt' in data)
+        && !('confirmedBy' in data)
+        && !('rejectedAt' in data)
+        && !('rejectedBy' in data)
+        && !('rejectionReason' in data)
+        && !('restockedAt' in data)
+        && data.get('totalsVerified', false) == false
+        && data.get('customerTotalsApplied', false) == false
+        && data.get('paymentStatus', 'unpaid') == 'unpaid';
+    }
+
+    // ---------------------------------------------------------------------
+    // Users
+    // ---------------------------------------------------------------------
+
+    match /users/{userId} {
+      allow read: if isAdmin() || (isSelf(userId));
+
+      allow create: if isSelf(userId)
+        && request.resource.data.role == 'customer'
+        && request.resource.data.totalOrders == 0
+        && request.resource.data.totalSpent == 0
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254;
+
+      // Customers may edit their own profile. System-managed fields stay
+      // immutable so nobody can promote themselves or rewrite spend totals.
+      allow update: if isAdmin() || (
+        isSelf(userId)
+       
+        && request.resource.data.get('role', 'customer')
+             == resource.data.get('role', 'customer')
+        && request.resource.data.get('totalOrders', 0)
+             == resource.data.get('totalOrders', 0)
+        && request.resource.data.get('totalSpent', 0)
+             == resource.data.get('totalSpent', 0)
+        && request.resource.data.get('email', '')
+             == resource.data.get('email', '')
+        && request.resource.data.get('isActive', true)
+             == resource.data.get('isActive', true)
+        && request.resource.data.get('admin', false)
+             == resource.data.get('admin', false)
+      );
+
+      allow delete: if isAdmin();
+
+      match /addresses/{addressId} {
+        allow read, write: if isAdmin() || (isSelf(userId));
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Catalog
+    // ---------------------------------------------------------------------
+
+    match /products/{productId} {
+      allow read: if true;
+
+      // Prices, stock and availability are administrator-owned. Customers have
+      // no write path at all, even during checkout: stock is deducted only by
+      // the administrator's confirmation transaction.
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /product_images/{imageId} {
+      // Customers must be able to display catalog images. Writes stay admin.
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Public store announcements shown on the customer home screen. Guests
+    // may read announcements that are active; all writes stay admin-owned.
+    //
+    // The active flag is read directly (not through `data.get()`) so Firestore
+    // can prove the app's public query `where('active', '==', true)` is safe.
+match /announcements/{announcementId} {
+  allow read: if isAdmin() || resource.data.active == true;
+  allow create, update: if isAdmin();
+  allow delete: if isAdmin();
+}
+
+match /hero_banners/{bannerId} {
+  allow read: if isAdmin() || resource.data.active == true;
+  allow create, update: if isAdmin();
+  allow delete: if isAdmin();
+}
+
+    // ---------------------------------------------------------------------
+    // Cart
+    // ---------------------------------------------------------------------
+
+    match /carts/{userId}/items/{itemId} {
+      allow read, write: if isAdmin() || (isSelf(userId));
+    }
+
+    // ---------------------------------------------------------------------
+    // Orders (customer requests + administrator-confirmed orders)
+    // ---------------------------------------------------------------------
+
+    match /orders/{orderId} {
+      // The duplicate-submission guard reads the deterministic order id inside
+      // the checkout transaction before the document exists. Allowing a
+      // signed-in read of a missing document lets that check run; it returns
+      // no data and does not expose existing orders.
+      allow read: if isAdmin()
+        || (isSignedIn() && resource == null)
+        || (isSelf(resource.data.customerId));
+
+      // Customer submission of a provisional request.
+      allow create: if isAdmin() || (
+        isSignedIn()
+       
+        && request.resource.data.customerId == request.auth.uid
+        && activeCustomer(request.auth.uid)
+        && request.resource.data.clientOrderId == orderId
+        && request.resource.data.clientOrderId is string
+        && request.resource.data.clientOrderId.size() >= 8
+        && request.resource.data.clientOrderId.size() <= 160
+        && request.resource.data.status == 'pending_confirmation'
+        && request.resource.data.paymentMethod in ['COD', 'GCash', 'Card']
+        && request.resource.data.get('paymentSimulated', false)
+             == (request.resource.data.paymentMethod != 'COD')
+        && request.resource.data.get('fulfillmentStatus', 'unfulfilled')
+             == 'unfulfilled'
+        && noPrivilegedOrderFields(request.resource.data)
+        && request.resource.data.customerName is string
+        && request.resource.data.customerName.size() > 0
+        && request.resource.data.shippingAddress is string
+        && request.resource.data.shippingAddress.size() > 0
+        && completeShippingAddress(
+             request.resource.data.get('shippingAddressMap', {})
+           )
+        && request.resource.data.itemCount is int
+        && request.resource.data.itemCount > 0
+        && request.resource.data.requestedItems is list
+        && request.resource.data.requestedItems.size() > 0
+        && request.resource.data.requestedItems.size() <= 50
+        && request.resource.data.items == request.resource.data.requestedItems
+        && request.resource.data.requestedSubtotal is int
+        && request.resource.data.requestedSubtotal >= 0
+        && request.resource.data.requestedShippingFee is int
+        && request.resource.data.requestedShippingFee >= 0
+        && request.resource.data.requestedTotal is int
+        && request.resource.data.requestedTotal >= 0
+        && request.resource.data.requestedTotal
+             == request.resource.data.requestedSubtotal
+                + request.resource.data.requestedShippingFee
+        && request.resource.data.subtotal == request.resource.data.requestedSubtotal
+        && request.resource.data.shippingFee == request.resource.data.requestedShippingFee
+        && request.resource.data.total == request.resource.data.requestedTotal
+        && request.resource.data.timeline is list
+      );
+
+      // Customer withdrawal of a still-pending request. Every price, item,
+      // total and payment field is frozen; only the cancellation metadata may
+      // change. Confirmed orders are administrator-only.
+      allow update: if isAdmin() || (
+        isSelf(resource.data.customerId)
+       
+        && resource.data.status == 'pending_confirmation'
+        && request.resource.data.status == 'cancelled'
+        && request.resource.data.customerId == resource.data.customerId
+        && request.resource.data.get('orderNumber', '')
+             == resource.data.get('orderNumber', '')
+        && request.resource.data.items == resource.data.items
+        && request.resource.data.get('requestedItems', [])
+             == resource.data.get('requestedItems', [])
+        && request.resource.data.get('requestedTotal', 0)
+             == resource.data.get('requestedTotal', 0)
+        && request.resource.data.total == resource.data.total
+        && request.resource.data.get('totalsVerified', false) == false
+        && request.resource.data.paymentMethod == resource.data.paymentMethod
+        && request.resource.data.get('paymentStatus', 'unpaid')
+             == resource.data.get('paymentStatus', 'unpaid')
+        && request.resource.data.get('paymentSimulated', false)
+             == resource.data.get('paymentSimulated', false)
+        && request.resource.data.get('customerTotalsApplied', false) == false
+        && request.resource.data.get('cancelledBy', '') == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly([
+               'status',
+               'cancelReason',
+               'cancelledAt',
+               'cancelledBy',
+               'restockPending',
+               'customerTotalsApplied',
+               'timeline',
+               'fulfillmentStatus',
+               'updatedAt'
+             ])
+        && request.resource.data.timeline is list
+      );
+
+      // Orders are financial records; customers and administrators never hard
+      // delete them. Rejection and cancellation preserve the audit trail.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Payment transaction records
+    // ---------------------------------------------------------------------
+    //
+    // Customers no longer write payment records: a request stays unpaid until
+    // the administrator confirms it. Only the dashboard may create or change
+    // these documents.
+
+    match /transactions/{transactionId} {
+      allow read: if isAdmin() || (isSelf(resource.data.customerId));
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // In-app notifications
+    // ---------------------------------------------------------------------
+
+   match /notifications/{notificationId} {
+  allow read: if isAdmin() || (isSelf(resource.data.recipientId));
+
+  allow create: if isAdmin() || (
+    isSignedIn()
+   
+    && validNotificationCore(request.resource.data)
+    && (
+      (
+        request.resource.data.recipientId == request.auth.uid
+        && request.resource.data.type == 'order_requested'
+        && request.resource.data.orderId is string
+        && orderBelongsToCustomerAfterWrite(request.resource.data.orderId, request.auth.uid)
+      )
+      || (
+        request.resource.data.recipientId == 'admin'
+        && request.resource.data.type == 'new_order_request'
+        && request.resource.data.orderId is string
+        && orderBelongsToCustomerAfterWrite(request.resource.data.orderId, request.auth.uid)
+      )
+      || (
+        request.resource.data.recipientId == 'admin'
+        && request.resource.data.type == 'order_cancelled'
+        && request.resource.data.orderId is string
+        && orderBelongsToCustomerAfterWrite(request.resource.data.orderId, request.auth.uid)
+      )
+      || (
+        request.resource.data.recipientId == 'admin'
+        && request.resource.data.type == 'chat_message'
+        && request.resource.data.customerId == request.auth.uid
+      )
+      || (
+        request.resource.data.recipientId == 'admin'
+        && request.resource.data.type == 'new_review'
+        && request.resource.data.reviewId is string
+        && request.resource.data.productId is string
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.reviewId
+             == request.resource.data.productId + '_' + request.auth.uid
+        && !exists(
+          /databases/$(database)/documents/reviews/$(request.resource.data.reviewId)
+        )
+        && existsAfter(
+          /databases/$(database)/documents/reviews/$(request.resource.data.reviewId)
+        )
+        && getAfter(
+          /databases/$(database)/documents/reviews/$(request.resource.data.reviewId)
+        ).data.customerId == request.auth.uid
+        && getAfter(
+          /databases/$(database)/documents/reviews/$(request.resource.data.reviewId)
+        ).data.productId == request.resource.data.productId
+        && getAfter(
+          /databases/$(database)/documents/reviews/$(request.resource.data.reviewId)
+        ).data.orderId == request.resource.data.orderId
+        && getAfter(
+          /databases/$(database)/documents/reviews/$(request.resource.data.reviewId)
+        ).data.rating == request.resource.data.rating
+      )
+    )
+  );
+
+  allow update: if isAdmin() || (
+    isSelf(resource.data.recipientId)
+   
+    && request.resource.data.diff(resource.data).affectedKeys()
+         .hasOnly(['isRead', 'readAt'])
+  );
+
+  allow delete: if isAdmin() || (isSelf(resource.data.recipientId));
+}
+
+    // ---------------------------------------------------------------------
+    // Customer <-> store messaging
+    // ---------------------------------------------------------------------
+
+    match /chats/{customerId} {
+      allow read: if isAdmin() || (isSelf(customerId));
+
+      allow create: if isAdmin() || (
+        isSelf(customerId)
+       
+        && request.resource.data.customerId == customerId
+      );
+
+      allow update: if isAdmin() || (isSelf(customerId));
+
+      allow delete: if isAdmin();
+
+      match /messages/{messageId} {
+        allow read: if isAdmin() || (isSelf(customerId));
+
+        allow create: if isAdmin() || (
+          isSelf(customerId)
+         
+          && request.resource.data.senderId == customerId
+          && request.resource.data.senderRole == 'customer'
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 2000
+          && request.resource.data.isRead == false
+        );
+
+        // Customers only mark administrator replies as read.
+        allow update: if isAdmin() || (
+          isSelf(customerId)
+         
+          && resource.data.senderRole == 'admin'
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['isRead'])
+        );
+
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Product reviews (one per customer per product, delivered orders only)
+    // ---------------------------------------------------------------------
+
+    match /reviews/{reviewId} {
+      allow read: if true;
+
+      allow create: if isSignedIn()
+       
+        && request.resource.data.customerId == request.auth.uid
+        && reviewId == request.resource.data.productId + '_' + request.auth.uid
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 1000
+        && deliveredOrderFor(request.resource.data.orderId, request.auth.uid);
+
+      allow update: if isSignedIn()
+       
+        && resource.data.customerId == request.auth.uid
+        && request.resource.data.customerId == resource.data.customerId
+        && request.resource.data.productId == resource.data.productId
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 1000
+        && deliveredOrderFor(request.resource.data.orderId, request.auth.uid);
+
+      allow delete: if isAdmin() || (isSelf(resource.data.customerId));
+    }
+    // ---------------------------------------------------------------------
+    // Store-wide settings and order counter
+    // ---------------------------------------------------------------------
+
+    match /settings/{docId} {
+      // Storefront contact/shipping settings and the security policy are
+      // readable so the public app can render before sign-in. Everything else
+      // stays administrator-only.
+      allow read: if docId in ['store', 'security'] || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // The official order counter is assigned only during administrator
+    // confirmation. Customers cannot read or write it.
+    match /counters/{counterId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ---------------------------------------------------------------------
+    // Administrator-only logs
+    // ---------------------------------------------------------------------
+
+    match /admin_activity_logs/{logId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /inventory_logs/{logId} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // Deny everything not explicitly matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+

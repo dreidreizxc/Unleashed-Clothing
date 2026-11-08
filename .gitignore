@@ -1,0 +1,100 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!.env.*.example
+!**/.env.example
+!**/.env.*.example
+
+# Firebase service account credentials
+serviceAccountKey.json
+**/serviceAccountKey.json
+*firebase-adminsdk*.json
+*service-account*.json
+
+# Android signing credentials
+**/key.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Flutter generated files
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+build/
+**/build/
+
+# Web generated files
+dist/
+**/dist/
+coverage/
+**/coverage/
+
+# Android generated files
+.gradle/
+**/.gradle/
+android/local.properties
+**/android/local.properties
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Firebase local cache
+.firebase/
+firebase-debug.log
+firestore-debug.log
+
+# Logs and debug output
+*.log
+firebase-deploy-debug.txt
+flutter_build_log.txt
+
+# Backup files and old copies
+*.backup
+*.backup-*
+*.bak
+*.before-*
+firebase.backup.json
+firebase.json.backup
+
+# Old Android project backup
+android_backup/
+
+# Machine-specific configuration
+**/local.properties
+
+# Generated Flutter platform files
+ios/Flutter/ephemeral/
+linux/flutter/ephemeral/
+macos/Flutter/ephemeral/
+
+# Additional backup file patterns
+*.backup.*
+*.pre-otp-backup
+
+# Nested Android backup folders
+**/android_backup/
+
+# Flutter generated ephemeral directories in nested projects
+**/ios/Flutter/ephemeral/
+**/linux/flutter/ephemeral/
+**/macos/Flutter/ephemeral/
+
+# Generated Flutter iOS configuration
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
